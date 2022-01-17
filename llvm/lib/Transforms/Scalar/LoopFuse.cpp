@@ -46,7 +46,10 @@
 
 #include "llvm/Transforms/Scalar/LoopFuse.h"
 #include "llvm/ADT/Statistic.h"
+#include "llvm/Analysis/AliasAnalysis.h"
+#include "llvm/Analysis/AliasSetTracker.h"
 #include "llvm/Analysis/AssumptionCache.h"
+#include "llvm/Analysis/BasicAliasAnalysis.h"
 #include "llvm/Analysis/DependenceAnalysis.h"
 #include "llvm/Analysis/DomTreeUpdater.h"
 #include "llvm/Analysis/LoopInfo.h"
@@ -55,6 +58,7 @@
 #include "llvm/Analysis/ScalarEvolution.h"
 #include "llvm/Analysis/ScalarEvolutionExpressions.h"
 #include "llvm/Analysis/TargetTransformInfo.h"
+#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/Verifier.h"
 #include "llvm/InitializePasses.h"
@@ -67,6 +71,7 @@
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
 #include "llvm/Transforms/Utils/CodeMoverUtils.h"
 #include "llvm/Transforms/Utils/LoopPeel.h"
+#include "llvm/Transforms/Utils/LoopUtils.h"
 
 using namespace llvm;
 
@@ -101,6 +106,8 @@ STATISTIC(NonEmptyGuardBlock, "Candidate has a non-empty guard block with "
 STATISTIC(NotRotated, "Candidate is not rotated");
 STATISTIC(OnlySecondCandidateIsGuarded,
           "The second candidate is guarded while the first one is not");
+STATISTIC(NumHoistedInsts, "Number of hoisted preheader instructions.");
+STATISTIC(NumSunkInsts, "Number of hoisted preheader instructions.");
 
 enum FusionDependenceAnalysisChoice {
   FUSION_DEPENDENCE_ANALYSIS_SCEV,
@@ -549,16 +556,16 @@ private:
   PostDominatorTree &PDT;
   OptimizationRemarkEmitter &ORE;
   AssumptionCache &AC;
-
   const TargetTransformInfo &TTI;
+  AAResults &AA;
 
 public:
   LoopFuser(LoopInfo &LI, DominatorTree &DT, DependenceInfo &DI,
             ScalarEvolution &SE, PostDominatorTree &PDT,
             OptimizationRemarkEmitter &ORE, const DataLayout &DL,
-            AssumptionCache &AC, const TargetTransformInfo &TTI)
+            AssumptionCache &AC, const TargetTransformInfo &TTI, AAResults &AA)
       : LDT(LI), DTU(DT, PDT, DomTreeUpdater::UpdateStrategy::Lazy), LI(LI),
-        DT(DT), DI(DI), SE(SE), PDT(PDT), ORE(ORE), AC(AC), TTI(TTI) {}
+        DT(DT), DI(DI), SE(SE), PDT(PDT), ORE(ORE), AC(AC), TTI(TTI), AA(AA) {}
 
   /// This is the main entry point for loop fusion. It will traverse the
   /// specified function and collect candidate loops to fuse, starting at the
@@ -914,16 +921,6 @@ private:
             continue;
           }
 
-          if (!isSafeToMoveBefore(*FC1->Preheader,
-                                  *FC0->Preheader->getTerminator(), DT, &PDT,
-                                  &DI)) {
-            LLVM_DEBUG(dbgs() << "Fusion candidate contains unsafe "
-                                 "instructions in preheader. Not fusing.\n");
-            reportLoopFusion<OptimizationRemarkMissed>(*FC0, *FC1,
-                                                       NonEmptyPreheader);
-            continue;
-          }
-
           if (FC0->GuardBranch) {
             assert(FC1->GuardBranch && "Expecting valid FC1 guard branch");
 
@@ -957,6 +954,32 @@ private:
             reportLoopFusion<OptimizationRemarkMissed>(*FC0, *FC1,
                                                        InvalidDependencies);
             continue;
+          }
+
+          // If the second loop has instructions in the pre-header, attempt to
+          // hoist them up to the first loop's pre-header or sink them into the
+          // body of the second loop.
+          if (!isEmptyPreheader(*FC1)) {
+            LLVM_DEBUG(dbgs() << "Fusion candidate does not have empty "
+                                 "preheader.\n");
+            // At this point, this is the last remaining legality check.
+            // Which means if we can make this pre-header empty, we can fuse
+            // these loops
+            SmallVector<Instruction *, 4> SafeToHoist;
+            SmallVector<Instruction *, 4> SafeToSink;
+            
+            // If it is not safe to hoist/sink all instructions in the
+            // pre-header, we cannot fuse these loops.
+            if (!collectMovablePreheaderInsts(*FC0, *FC1, SafeToHoist, SafeToSink)) { 
+              LLVM_DEBUG(dbgs() << "Could not hoist/sink all instructions in "
+                                   "Fusion Candidate Pre-header.\n"
+                                << "Not Fusing.\n");
+              reportLoopFusion<OptimizationRemarkMissed>(*FC0, *FC1,
+                                                         NonEmptyPreheader);
+              continue;
+            }
+            // Execute the hoist/sink operations on preheader instructions
+            movePreheaderInsts(*FC0, *FC1, SafeToHoist, SafeToSink);
           }
 
           bool BeneficialToFuse = isBeneficialFusion(*FC0, *FC1);
@@ -1020,6 +1043,74 @@ private:
       }
     }
     return Fused;
+  }
+
+  /// Collect instructions in the \p FC1 Preheader that can be hoisted
+  /// to the \p FC0 Preheader or sunk into the \p FC1 Body
+  bool collectMovablePreheaderInsts(
+      const FusionCandidate &FC0, const FusionCandidate &FC1,
+      SmallVector<Instruction *, 4> &SafeToHoist,
+      SmallVector<Instruction *, 4> &SafeToSink) const {
+    BasicBlock *FC1Preheader = FC1.Preheader;
+    for (auto &I : *FC1Preheader) {
+      // Can't move a branch
+      if (&I == FC1Preheader->getTerminator())
+        continue;
+      // If the instruction has side-effects, give up.
+      // TODO: The case of mayReadFromMemory we can handle but requires
+      // additional work with a dependence analysis so for now we give
+      // up on memory reads.
+      if (I.mayWriteToMemory() || I.mayThrow() || I.mayReadFromMemory()) {
+        LLVM_DEBUG(dbgs() << "Inst: " << I << " has side-effects.\n");
+        return false;
+      }
+      // Compute alias set needed for canSinkOrHoinstInst
+      AliasSetTracker CurAST0(AA);
+      for (BasicBlock *BB : FC0.L->blocks())
+        CurAST0.add(*BB);
+
+      AliasSetTracker CurAST1(AA);
+      for (BasicBlock *BB : FC1.L->blocks())
+        CurAST1.add(*BB);
+      CurAST1.add(*FC1Preheader);
+      // Default behaviour of this routine as defined in LICM decides
+      // to not hoist or sink debug intrinsics because it is not useful.
+      // For us it is useful so we make a special case here, instead of
+      // changing LICM code which would result in more side-effects.
+      if (!isa<DbgInfoIntrinsic>(I) &&
+          !canSinkOrHoistInst(I, &AA, &DT, FC0.L, &CurAST0, nullptr, true) &&
+          !canSinkOrHoistInst(I, &AA, &DT, FC1.L, &CurAST1, nullptr, true)) {
+        LLVM_DEBUG(dbgs() << "Inst: " << I << " cannot be sunk or hoisted.\n");
+        return false;
+      }
+      // First check if can be hoisted
+      // If the operands of this instruction dominate the FC0 Preheader
+      // target block, then it is safe to move them to the end of the FC0
+      BasicBlock *FC0PreheaderTarget = FC0.Preheader->getSingleSuccessor();
+      assert(FC0PreheaderTarget &&
+             "Expected single successor for loop preheader.");
+      bool OperandsDomFC0Body = true;
+      for (auto &Op : I.operands())
+        if (Instruction *OpInst = dyn_cast<Instruction>(Op))
+          if (!DT.dominates(OpInst, FC0PreheaderTarget)) {
+            OperandsDomFC0Body = false;
+            continue;
+          }
+
+      if (OperandsDomFC0Body)
+        SafeToHoist.push_back(&I);
+      else {
+        // If I is not used in FC1.L, it can be sunk
+        for (auto U : I.users()) {
+          if (Instruction *UI = dyn_cast<Instruction>(U))
+            if (!DT.dominates(FC1.ExitBlock, UI->getParent()))
+              return false; // Cannot sink or hoist; might as well stop here
+        }
+        // second loop does not contain users of I, safe to sink
+        SafeToSink.push_back(&I);
+      }
+    }
+    return true;
   }
 
   /// Rewrite all additive recurrences in a SCEV to use a new loop.
@@ -1233,6 +1324,39 @@ private:
       return FC0.getNonLoopBlock() == FC1.getEntryBlock();
     else
       return FC0.ExitBlock == FC1.getEntryBlock();
+  }
+
+  bool isEmptyPreheader(const FusionCandidate &FC) const {
+    return FC.Preheader->size() == 1;
+  }
+
+  /// Hoist \p FC1 Preheader instructions to \p FC0 Preheader
+  /// and sink others into the body of \p FC1.
+  void movePreheaderInsts(const FusionCandidate &FC0,
+                          const FusionCandidate &FC1,
+                          SmallVector<Instruction *, 4> &HoistInsts,
+                          SmallVector<Instruction *, 4> &SinkInsts) const {
+    LLVM_DEBUG(if (VerboseFusionDebugging) {
+      if (!HoistInsts.empty())
+        dbgs() << "Hoisting: \n";
+      for (auto I : HoistInsts)
+        dbgs() << *I << "\n";
+      if (!SinkInsts.empty())
+        dbgs() << "Sinking: \n";
+      for (auto I : SinkInsts)
+        dbgs() << *I << "\n";
+    });
+    for (auto I : HoistInsts) {
+      assert(I->getParent() == FC1.Preheader);
+      NumHoistedInsts++;
+      I->moveBefore(FC0.Preheader->getTerminator());
+    }
+    // insert instructions in reverse order to maintain dominance relationship
+    for (auto I : reverse(SinkInsts)) {
+      assert(I->getParent() == FC1.Preheader);
+      NumSunkInsts++;
+      I->moveBefore(&*FC1.ExitBlock->getFirstInsertionPt());
+    }
   }
 
   /// Determine if two fusion candidates have identical guards
@@ -1820,6 +1944,7 @@ struct LoopFuseLegacy : public FunctionPass {
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
     AU.addRequiredID(LoopSimplifyID);
+    AU.addRequired<AAResultsWrapperPass>();
     AU.addRequired<ScalarEvolutionWrapperPass>();
     AU.addRequired<LoopInfoWrapperPass>();
     AU.addRequired<DominatorTreeWrapperPass>();
@@ -1838,6 +1963,7 @@ struct LoopFuseLegacy : public FunctionPass {
   bool runOnFunction(Function &F) override {
     if (skipFunction(F))
       return false;
+
     auto &LI = getAnalysis<LoopInfoWrapperPass>().getLoopInfo();
     auto &DT = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
     auto &DI = getAnalysis<DependenceAnalysisWrapperPass>().getDI();
@@ -1847,9 +1973,10 @@ struct LoopFuseLegacy : public FunctionPass {
     auto &AC = getAnalysis<AssumptionCacheTracker>().getAssumptionCache(F);
     const TargetTransformInfo &TTI =
         getAnalysis<TargetTransformInfoWrapperPass>().getTTI(F);
+    auto &AA = getAnalysis<AAResultsWrapperPass>().getAAResults();
     const DataLayout &DL = F.getParent()->getDataLayout();
 
-    LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL, AC, TTI);
+    LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL, AC, TTI, AA);
     return LF.fuseLoops(F);
   }
 };
@@ -1864,9 +1991,10 @@ PreservedAnalyses LoopFusePass::run(Function &F, FunctionAnalysisManager &AM) {
   auto &ORE = AM.getResult<OptimizationRemarkEmitterAnalysis>(F);
   auto &AC = AM.getResult<AssumptionAnalysis>(F);
   const TargetTransformInfo &TTI = AM.getResult<TargetIRAnalysis>(F);
+  auto &AA = AM.getResult<AAManager>(F);
   const DataLayout &DL = F.getParent()->getDataLayout();
 
-  LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL, AC, TTI);
+  LoopFuser LF(LI, DT, DI, SE, PDT, ORE, DL, AC, TTI, AA);
   bool Changed = LF.fuseLoops(F);
   if (!Changed)
     return PreservedAnalyses::all();
