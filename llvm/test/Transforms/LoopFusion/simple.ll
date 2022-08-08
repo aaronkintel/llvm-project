@@ -509,7 +509,7 @@ define i64 @unsafe_preheader(i32* %A, i64 %x) {
 ; CHECK-NEXT:    [[J:%.*]] = phi i64 [ [[ADD]], [[FOR_FIRST_EXIT]] ], [ [[INC_J:%.*]], [[FOR_SECOND]] ]
 ; CHECK-NEXT:    [[AJ:%.*]] = getelementptr inbounds i32, i32* [[A]], i64 [[J]]
 ; CHECK-NEXT:    store i32 2, i32* [[AJ]], align 4
-; CHECK-NEXT:    [[INC_J]] = add nsw i64 [[J]], 1
+; CHECK-NEXT:    [[INC_J]] = add nsw i64 [[J]], [[ADD]]
 ; CHECK-NEXT:    [[CMP_J:%.*]] = icmp slt i64 [[INC_J]], 100
 ; CHECK-NEXT:    br i1 [[CMP_J]], label [[FOR_SECOND]], label [[FOR_SECOND_EXIT:%.*]]
 ; CHECK:       for.second.exit:
@@ -534,7 +534,7 @@ for.second:
   %j = phi i64 [ %add, %for.first.exit ], [ %inc.j, %for.second ]
   %Aj = getelementptr inbounds i32, i32* %A, i64 %j
   store i32 2, i32* %Aj, align 4
-  %inc.j = add nsw i64 %j, 1
+  %inc.j = add nsw i64 %j, %add
   %cmp.j = icmp slt i64 %inc.j, 100
   br i1 %cmp.j, label %for.second, label %for.second.exit
 
